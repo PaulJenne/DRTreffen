@@ -1,0 +1,337 @@
+import tensorflow as tf
+import numpy as np
+import pandas as pd
+import os
+import cv2
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, roc_curve
+
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras import layers, models
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Activation, Flatten, Dropout, BatchNormalization, Conv2D, MaxPooling2D
+from tensorflow.keras import regularizers, optimizers
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras import Model
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.preprocessing.image import img_to_array
+
+
+# ----------------------DATEN----------------------
+def append_ext(fn):
+    return fn + ".tif"  # Bildformat ist .tif
+
+# Einlesen der csv-Dateien als String
+traindf = pd.read_csv('/Users/pauljenne/Downloads/train_labels.csv', dtype=str)
+testdf = pd.read_csv('/Users/pauljenne/Downloads/sample_submission.csv', dtype=str)
+
+# Anhängen der Dateiendung an die ID
+traindf["id"] = traindf["id"].apply(append_ext)
+testdf["id"] = testdf["id"].apply(append_ext)
+
+# ----------------------DATENGENERATOR----------------------
+# ImageDataGenerator with rescaling and validation split (25% of the data will go to the validation set)
+datagen = ImageDataGenerator(
+    rescale=1./255.,
+    validation_split=0.25,
+    rotation_range=20,  # Rotate the image randomly within the range of -20 to +20 degrees
+    width_shift_range=0.1,  # Shift the width of the image randomly within the range of -0.1 to +0.1
+    height_shift_range=0.1,  # Shift the height of the image randomly within the range of -0.1 to +0.1
+    shear_range=0.2,  # Apply shear transformation randomly within the range of -0.2 to +0.2
+    zoom_range=0.2,  # Zoom the image randomly within the range of 0.8 to 1.2
+    horizontal_flip=True,  # Flip the image horizontally randomly
+    vertical_flip=True  # Flip the image vertically randomly
+)
+
+
+train_generator = datagen.flow_from_dataframe(
+    dataframe=traindf,
+    directory='/Users/pauljenne/Downloads/train',
+    x_col="id",
+    y_col="label",
+    subset="training",
+    batch_size=32,
+    seed=42,
+    shuffle=False,
+    class_mode="binary",
+    target_size=(96, 96)  
+)
+
+valid_generator = datagen.flow_from_dataframe(
+    dataframe=traindf,
+    directory='/Users/pauljenne/Downloads/train',
+    x_col="id",
+    y_col="label",
+    subset="validation",
+    batch_size=32,
+    seed=42,
+    shuffle=False,
+    class_mode="binary",  
+    target_size=(96, 96)
+)
+
+test_datagen = ImageDataGenerator(rescale=1./255.)
+test_generator = test_datagen.flow_from_dataframe(
+    dataframe=testdf,
+    directory='/Users/pauljenne/Downloads/test',
+    x_col="id",
+    y_col=None,
+    batch_size=32,
+    seed=42,
+    shuffle=False,
+    class_mode=None,
+    target_size=(96, 96)
+)
+
+train_labels_path = '/Users/pauljenne/Downloads/train_labels.csv'
+sample_submission_path = '/Users/pauljenne/Downloads/sample_submission.csv'
+sample_submission = pd.read_csv('/Users/pauljenne/Downloads/sample_submission.csv', dtype=str)
+# Specify the path to the folder containing the images
+images_folder = '/Users/pauljenne/Downloads/train'
+# Add a new column to the DataFrame with the full path to the image
+traindf['image_path'] = traindf['id'].apply(lambda x: os.path.join(images_folder, f'{x}.tif'))
+# Display the first few rows of the dataframes
+print("Train Labels:")
+print(traindf.head())
+
+print("\nSample Submission:")
+print(sample_submission.head())
+
+# ----------------------Beispielbilder----------------------
+# Display a few images and their labels of the training set, validation set and test set
+
+# Display a few images and their labels from the training set
+train_images = train_generator.next()[0]
+train_labels = train_generator.next()[1]
+train_class_labels = train_generator.class_indices
+
+fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+axes = axes.ravel()
+
+for i in range(4):
+    axes[i].imshow(train_images[i])
+    axes[i].set_title(f"Label: {train_labels[i]}")
+    axes[i].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+# Display a few images and their labels from the training set
+train_batch = train_generator.next()
+train_images = train_batch[0]
+train_labels = train_batch[1]
+
+fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+axes = axes.ravel()
+
+for i in range(4):
+    axes[i].imshow(train_images[i])
+    axes[i].set_title(f"Label: {train_labels[i]}")
+    axes[i].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+# Display a few images and their labels from the validation set
+valid_batch = valid_generator.next()
+valid_images = valid_batch[0]
+valid_labels = valid_batch[1]
+
+fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+axes = axes.ravel()
+
+for i in range(4):
+    axes[i].imshow(valid_images[i])
+    axes[i].set_title(f"Label: {valid_labels[i]}")
+    axes[i].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
+#----------------------MODEL----------------------
+class TransferModel:
+
+    def __init__(self, input_shape: tuple):
+        self.input_shape = input_shape
+        self.model = self.build_model()
+
+    def build_model(self):
+        # Use pre-trained ResNet model
+        base_model = ResNet50(
+            include_top=False,
+            input_shape=self.input_shape,
+            weights='imagenet'
+        )
+
+        # Allow parameter updates for all layers
+        base_model.trainable = True
+
+        # Add a new pooling layer on the original output
+        add_to_base = base_model.output
+        add_to_base = GlobalAveragePooling2D(data_format='channels_last', name='head_gap')(add_to_base)
+
+        # Add new output layer as head
+        new_output = Dense(1, activation='sigmoid', name='head_pred')(add_to_base)  # Assuming binary classification
+
+        # Define model
+        model = Model(base_model.input, new_output)
+
+        return model
+    
+    def train(self,
+              train_generator,
+              epochs: int,
+              valid_generator=None,
+              class_weights=None):
+
+        # Define early stopping as callback
+        early_stopping = EarlyStopping(monitor='val_loss',
+                                       min_delta=0,
+                                       patience=12,
+                                       restore_best_weights=True)
+
+        callbacks = [early_stopping]
+
+        # Fitting
+        self.history = self.model.fit(train_generator,
+                                      epochs=epochs,
+                                      validation_data=valid_generator,
+                                      callbacks=callbacks,
+                                      class_weight=class_weights)
+
+        return self.history
+    
+
+    def compile_model(self, **kwargs):
+        self.model.compile(**kwargs)
+
+
+
+        def grad_cam(self, image, layer_name):
+            # Convert the image to a tensor
+            image_tensor = tf.convert_to_tensor(image)
+            image_tensor = tf.expand_dims(image_tensor, axis=0)
+
+            # Get the output of the specified layer
+            output = self.model.get_layer(layer_name).output
+
+            # Get the gradient tape
+            with tf.GradientTape() as tape:
+                # Forward pass through the model
+                conv_output, predictions = self.model(image_tensor)
+                predicted_class = tf.argmax(predictions[0])
+
+                # Calculate the gradients of the predicted class with respect to the output feature map
+                grads = tape.gradient(predictions[:, predicted_class], output)
+
+            # Compute the guided gradients
+            guided_grads = tf.cast(output > 0, 'float32') * tf.cast(grads > 0, 'float32') * grads
+
+            # Get the weights of the guided gradients
+            weights = tf.reduce_mean(guided_grads, axis=(0, 1))
+
+            # Get the feature map of the specified layer
+            feature_map = self.model.get_layer(layer_name).output[0]
+
+            # Create the heatmap
+            heatmap = tf.reduce_sum(tf.multiply(weights, feature_map), axis=-1)
+            heatmap = np.maximum(heatmap, 0)
+            heatmap /= np.max(heatmap)
+
+            # Resize the heatmap to match the original image size
+            heatmap = cv2.resize(heatmap.numpy(), (image.shape[1], image.shape[0]))
+            heatmap = np.uint8(255 * heatmap)
+
+            # Apply the heatmap to the original image
+            heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+            superimposed_img = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
+
+            return superimposed_img
+
+
+
+# Example usage
+input_shape = (96, 96, 3)
+transfer_model = TransferModel(input_shape)
+transfer_model.compile_model(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# ----------------------TRAINING----------------------
+# Calculate steps per epoch and validation steps
+steps_per_epoch = len(train_generator)
+validation_steps = len(valid_generator)
+
+# Train the model using your data generators
+history = transfer_model.train(train_generator, epochs=15, valid_generator=valid_generator)
+
+# ----------------------EVALUATION----------------------
+plt.figure(figsize=(12, 6))
+
+# Plot Loss
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.legend()
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss')
+
+# Plot Accuracy
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.legend()
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Training and Validation Accuracy')
+
+
+# Display the ROC-AUC values
+train_predictions = transfer_model.model.predict(train_generator)
+valid_predictions = transfer_model.model.predict(valid_generator)
+
+train_roc_auc = roc_auc_score(train_generator.classes, train_predictions)
+valid_roc_auc = roc_auc_score(valid_generator.classes, valid_predictions)
+
+print(f'Train ROC-AUC: {train_roc_auc:.4f}')
+print(f'Validation ROC-AUC: {valid_roc_auc:.4f}')
+
+# Calculate the false positive rate (1-specificity) and true positive rate (sensitivity)
+train_fpr, train_tpr, _ = roc_curve(train_generator.classes, train_predictions)
+valid_fpr, valid_tpr, _ = roc_curve(valid_generator.classes, valid_predictions)
+
+# Display the ROC curve
+plt.figure(figsize=(8, 6))
+plt.plot(train_fpr, train_tpr, label='Train ROC Curve')
+plt.plot(valid_fpr, valid_tpr, label='Validation ROC Curve')
+plt.plot([0, 1], [0, 1], 'k--', label='Random Guess')
+plt.xlabel('False Positive Rate (1 - Specificity)')
+plt.ylabel('True Positive Rate (Sensitivity)')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend()
+
+plt.show()
+
+# ----------------------GRAD-CAM----------------------
+num_samples = 6
+sample_images = valid_images[:num_samples]  # Change this to the desired number of samples
+
+plt.figure(figsize=(15, 10))
+
+for i in range(num_samples):
+    plt.subplot(2, 3, i+1)
+    sample_image = sample_images[i]
+    heatmap = transfer_model.grad_cam(sample_image, layer_name='conv5_block3_out')
+
+    # Display the original image with the heatmap
+    plt.imshow(sample_image)
+    plt.imshow(heatmap, alpha=0.6, cmap='jet')
+    plt.title(f'Sample {i+1}')
+    plt.axis('off')
+
+plt.tight_layout()
+plt.show()
